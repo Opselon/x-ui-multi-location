@@ -97,3 +97,22 @@ As long as the path (or query parameter) contains a valid subscription ID, the W
 - **Telegram notification missing:** Ensure the bot token and chat ID are correct and that the bot has permission to post in the channel/group.
 
 Once deployed and configured, push the Worker code to your Git repository so you can keep track of future adjustments to target hosts, prefixes, and notification behavior.
+
+## 5. Push to GitHub (main branch)
+
+To publish the Worker source to GitHub on the `main` branch:
+
+1. Ensure your local branch is named `main`:
+   ```bash
+   git branch -m main
+   ```
+2. Add your GitHub repository as the remote:
+   ```bash
+   git remote add origin https://github.com/<your-account>/<your-repo>.git
+   ```
+3. Push the code to the `main` branch:
+   ```bash
+   git push -u origin main
+   ```
+
+If the remote already exists, replace step 2 with `git remote set-url origin <new-url>`.
