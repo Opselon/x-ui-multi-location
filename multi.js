@@ -18,6 +18,12 @@ const SETTINGS = {
   FETCH_TIMEOUT: 8000, // 5 ثانیه
   // حداکثر حجم محتوای قابل قبول از هر سرور (به بایت)
   MAX_CONTENT_LENGTH: 5 * 1024 * 1024, // 5 مگابایت
+  TELEGRAM: {
+    enabled: true,
+    botToken: 'your-telegram-bot-token',
+    chatId: '@your_channel_or_chat_id',
+    parseMode: 'HTML',
+  },
 };
 
 const TARGETS = [
@@ -164,6 +170,7 @@ async function handleRequest(request, event) {
   const idExtractionStrategies = [idFromPathPrefix, idFromFullPath, idFromQueryParam, idFromLastPathSegment];
 
   let finalProcessedData = null;
+  let successfulSubId = null;
 
   for (const strategy of idExtractionStrategies) {
     let potentialSubId;
@@ -196,6 +203,7 @@ async function handleRequest(request, event) {
     if (processedData.hadAnySuccess) {
       console.log(`SUCCESS: Received a valid response for the ID from algorithm '${strategy.name}'. Stopping here.`);
       finalProcessedData = processedData;
+      successfulSubId = potentialSubId;
       break;
     } else {
       console.log(`INFO: All fetches failed for ID from algorithm '${strategy.name}'. Trying next strategy...`);
@@ -206,6 +214,18 @@ async function handleRequest(request, event) {
     const hasContent = (finalProcessedData.jsonContents?.length || 0) > 0 ||
                        (finalProcessedData.otherContents?.length || 0) > 0;
     if (hasContent) {
+      if (event && typeof event.waitUntil === 'function') {
+        try {
+          event.waitUntil(sendSubscriptionNotification({
+            request,
+            context,
+            processedData: finalProcessedData,
+            subId: successfulSubId,
+          }));
+        } catch (notifyErr) {
+          console.warn('Failed to enqueue Telegram notification:', notifyErr);
+        }
+      }
       return buildResponse(finalProcessedData, context);
     } else {
       const safeCorsHeaders = typeof corsHeaders === 'object' ? corsHeaders : {};
@@ -735,23 +755,161 @@ async function processResults(results, subId) {
   return processed;
 }
 
+async function sendSubscriptionNotification({ request, context, processedData, subId }) {
+  try {
+    const telegramConfig = resolveTelegramSettings();
+    if (!telegramConfig) {
+      return;
+    }
+
+    const remarks = extractRemarksFromProcessedData(processedData).slice(0, 10);
+    const remarkText = remarks.length ? remarks.join('\n') : 'No remark information available.';
+
+    const clientIp = request?.headers?.get('cf-connecting-ip') ||
+      request?.headers?.get('x-real-ip') ||
+      request?.headers?.get('x-forwarded-for') ||
+      'unknown';
+    const userAgent = request?.headers?.get('user-agent') || 'unknown';
+    const requestUrl = context?.url?.toString?.() || request?.url || 'unknown';
+
+    const messageLines = [
+      '<b>Subscription Fetch Detected</b>',
+      `🆔 <b>ID:</b> ${escapeHtml(subId || 'N/A')}`,
+      `🌐 <b>URL:</b> ${escapeHtml(requestUrl)}`,
+      `📍 <b>IP:</b> ${escapeHtml(clientIp)}`,
+      `🖥️ <b>User-Agent:</b> ${escapeHtml(userAgent)}`,
+      '',
+      '<b>Remarks</b>',
+      escapeHtml(remarkText),
+    ];
+
+    const body = {
+      chat_id: telegramConfig.chatId,
+      text: messageLines.join('\n'),
+    };
+
+    if (telegramConfig.parseMode) {
+      body.parse_mode = telegramConfig.parseMode;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${telegramConfig.botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        console.warn(`Telegram API responded with status ${response.status}`);
+      }
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  } catch (err) {
+    console.error('sendSubscriptionNotification error:', err?.message || err);
+  }
+}
+
+function resolveTelegramSettings() {
+  try {
+    const base = (SETTINGS && SETTINGS.TELEGRAM) ? SETTINGS.TELEGRAM : {};
+    const enabled = typeof base.enabled === 'boolean' ? base.enabled : true;
+
+    if (!enabled) return null;
+
+    const globalEnv = typeof globalThis === 'object' && globalThis ? globalThis : {};
+    const tokenFromGlobal = typeof globalEnv['TELEGRAM_BOT_TOKEN'] !== 'undefined'
+      ? `${globalEnv['TELEGRAM_BOT_TOKEN']}`.trim()
+      : '';
+    const chatFromGlobal = typeof globalEnv['TELEGRAM_CHAT_ID'] !== 'undefined'
+      ? `${globalEnv['TELEGRAM_CHAT_ID']}`.trim()
+      : '';
+
+    const botToken = tokenFromGlobal || (typeof base.botToken === 'string' ? base.botToken.trim() : '');
+    const chatId = chatFromGlobal || (typeof base.chatId === 'string' ? base.chatId.trim() : '');
+
+    if (!botToken || !chatId) {
+      console.warn('Telegram notification skipped: bot token or chat id missing.');
+      return null;
+    }
+
+    const parseMode = typeof base.parseMode === 'string' && base.parseMode ? base.parseMode : undefined;
+
+    return { botToken, chatId, parseMode };
+  } catch (err) {
+    console.error('resolveTelegramSettings error:', err?.message || err);
+    return null;
+  }
+}
+
+function extractRemarksFromProcessedData(processedData) {
+  const remarks = new Set();
+
+  if (processedData && Array.isArray(processedData.jsonContents)) {
+    for (const item of processedData.jsonContents) {
+      if (item && typeof item === 'object') {
+        const candidate = item.ps || item.remark || item.name || item.title;
+        if (typeof candidate === 'string' && candidate.trim()) {
+          remarks.add(candidate.trim());
+        }
+      }
+    }
+  }
+
+  if (processedData && Array.isArray(processedData.otherContents)) {
+    for (const chunk of processedData.otherContents) {
+      if (typeof chunk !== 'string') continue;
+      const lines = chunk.split(/\r?\n/);
+      for (const line of lines) {
+        if (typeof line !== 'string') continue;
+        const idx = line.indexOf('#');
+        if (idx === -1) continue;
+        const rawRemark = line.slice(idx + 1).trim();
+        if (!rawRemark) continue;
+        let decoded = rawRemark;
+        try {
+          decoded = decodeURIComponent(rawRemark);
+        } catch {
+          decoded = rawRemark;
+        }
+        if (decoded) {
+          remarks.add(decoded.trim());
+        }
+      }
+    }
+  }
+
+  return Array.from(remarks);
+}
+
+function escapeHtml(value) {
+  const str = typeof value === 'string' ? value : String(value ?? '');
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function tryDecode(text) {
   try {
-  // اگر ورودی رشته نیست، آن را به رشته تبدیل می‌کنیم
-  const safeText = typeof text === 'string' ? text : String(text);
-  // Trim کردن فضای اضافی
-  const trimmedText = safeText.trim();
-  
-  // تلاش برای دیکد Base64 با تابع امن
-  const decoded = b64DecodeUnicode(trimmedText);
-  
-  // اگر دیکد موفق بود، نتیجه را برگردان، در غیر اینصورت متن اصلی
-  return decoded !== null ? decoded : trimmedText;
+    // اگر ورودی رشته نیست، آن را به رشته تبدیل می‌کنیم
+    const safeText = typeof text === 'string' ? text : String(text);
+    // Trim کردن فضای اضافی
+    const trimmedText = safeText.trim();
+
+    // تلاش برای دیکد Base64 با تابع امن
+    const decoded = b64DecodeUnicode(trimmedText);
+
+    // اگر دیکد موفق بود، نتیجه را برگردان، در غیر اینصورت متن اصلی
+    return decoded !== null ? decoded : trimmedText;
   } catch (err) {
-  console.warn('tryDecode error:', err);
-  return String(text || ''); // fallback امن
+    console.warn('tryDecode error:', err);
+    return String(text || ''); // fallback امن
   }
-  }
+}
 
 
 /**
