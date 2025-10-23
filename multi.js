@@ -18,6 +18,12 @@ const SETTINGS = {
   FETCH_TIMEOUT: 8000, // 5 ثانیه
   // حداکثر حجم محتوای قابل قبول از هر سرور (به بایت)
   MAX_CONTENT_LENGTH: 5 * 1024 * 1024, // 5 مگابایت
+  TELEGRAM: {
+    enabled: true,
+    botToken: 'your-telegram-bot-token',
+    chatId: '@your_channel_or_chat_id',
+    parseMode: 'HTML',
+  },
 };
 
 const TARGETS = [
@@ -27,6 +33,98 @@ const TARGETS = [
   { host: 'se.vip.ajax-cdn.xyz', port: '2096', pathPrefix: '/k2bfA3bQh8XcM7R9zn92/'},
   { host: 'sweden.vip.ajax-cdn.xyz', port: '2096', pathPrefix: '/k2bfA3bQh8XcM7R9zn92/' },
 ];
+
+const PATH_PREFIX_PLACEHOLDER = 'jsonreadytocatchupdatefast';
+
+const SMART_PREFIX_SETTINGS = (() => {
+  try {
+    if (!Array.isArray(TARGETS) || TARGETS.length === 0) {
+      return null;
+    }
+
+    const firstPrefixRaw = TARGETS[0]?.pathPrefix;
+    if (typeof firstPrefixRaw !== 'string') {
+      return null;
+    }
+
+    const normalized = firstPrefixRaw.replace(/^\/+|\/+$/g, '').trim();
+    if (!normalized || normalized === PATH_PREFIX_PLACEHOLDER) {
+      return null;
+    }
+
+    const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const withLeading = `/${normalized}`;
+    const withTrailing = `${normalized}/`;
+    const withBoth = `/${normalized}/`;
+
+    return {
+      normalized,
+      replacements: [
+        { regex: new RegExp(escapeRegExp(`/${PATH_PREFIX_PLACEHOLDER}/`), 'g'), replacement: withBoth },
+        { regex: new RegExp(escapeRegExp(`/${PATH_PREFIX_PLACEHOLDER}`), 'g'), replacement: withLeading },
+        { regex: new RegExp(escapeRegExp(`${PATH_PREFIX_PLACEHOLDER}/`), 'g'), replacement: withTrailing },
+        { regex: new RegExp(escapeRegExp(PATH_PREFIX_PLACEHOLDER), 'g'), replacement: normalized },
+      ],
+    };
+  } catch (err) {
+    console.warn('SMART_PREFIX_SETTINGS initialization failed:', err?.message || err);
+    return null;
+  }
+})();
+
+function applySmartPrefixReplacementToString(value) {
+  if (typeof value !== 'string') {
+    return value;
+  }
+
+  if (!SMART_PREFIX_SETTINGS) {
+    return value;
+  }
+
+  let result = value;
+  for (const rule of SMART_PREFIX_SETTINGS.replacements) {
+    result = result.replace(rule.regex, rule.replacement);
+  }
+  return result;
+}
+
+function applySmartPrefixReplacementToJson(value) {
+  if (!SMART_PREFIX_SETTINGS) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(item => applySmartPrefixReplacementToJson(item));
+  }
+
+  if (value && typeof value === 'object') {
+    const clone = Array.isArray(value) ? [] : {};
+    for (const key of Object.keys(value)) {
+      clone[key] = applySmartPrefixReplacementToJson(value[key]);
+    }
+    return clone;
+  }
+
+  if (typeof value === 'string') {
+    return applySmartPrefixReplacementToString(value);
+  }
+
+  return value;
+}
+
+function getNormalizedExtraSubscriptions() {
+  const raw = Array.isArray(EXTRA_SUB_CONFIGS) ? EXTRA_SUB_CONFIGS : [];
+  const extras = [];
+
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    extras.push(applySmartPrefixReplacementToString(trimmed));
+  }
+
+  return extras;
+}
 
 // هدرهای استاندارد CORS برای پاسخ‌ها
 const corsHeaders = {
@@ -159,11 +257,15 @@ async function handleRequest(request, event) {
   }
 
   const context = parseRequestContext(request);
+  context.extraSubscriptions = getNormalizedExtraSubscriptions();
+  const extrasAvailable = Array.isArray(context.extraSubscriptions) && context.extraSubscriptions.length > 0;
   console.log(`Processing request for path: ${context.url.pathname}`);
 
   const idExtractionStrategies = [idFromPathPrefix, idFromFullPath, idFromQueryParam, idFromLastPathSegment];
 
   let finalProcessedData = null;
+  let successfulSubId = null;
+  let lastFailureContext = null;
 
   for (const strategy of idExtractionStrategies) {
     let potentialSubId;
@@ -188,14 +290,49 @@ async function handleRequest(request, event) {
       } else {
         console.error(`[ERROR] performFetches failed for ID from ${strategy.name}: ${e.message}`);
       }
+      lastFailureContext = {
+        strategy: strategy.name,
+        subId: potentialSubId,
+        errorMessage: e?.message || String(e),
+      };
       continue;
     }
 
     const processedData = await processResults(fetchResults, potentialSubId);
 
+    const usedFallbackExtras = !processedData.hadAnySuccess && extrasAvailable;
+
+    if (usedFallbackExtras) {
+      console.warn(`All upstream targets failed for ID '${potentialSubId}'. Serving fallback extras.`);
+      processedData.hadAnySuccess = true;
+      processedData.usedFallbackExtras = true;
+      if (Array.isArray(processedData.sources)) {
+        if (!processedData.sources.includes('fallback://extras')) {
+          processedData.sources.push('fallback://extras');
+        }
+      }
+      if (Array.isArray(processedData.debugInfo)) {
+        processedData.debugInfo.push({
+          target: 'fallback://extras',
+          status: 'synthetic',
+          details: 'Served preconfigured extra subscriptions due to upstream failures.',
+        });
+      }
+    }
+
+    lastFailureContext = {
+      strategy: strategy.name,
+      subId: potentialSubId,
+      processedData,
+      errorMessage: usedFallbackExtras
+        ? 'All upstream targets failed; served fallback extra subscriptions.'
+        : (processedData.hadAnySuccess ? undefined : 'All upstream targets failed to provide usable content.'),
+    };
+
     if (processedData.hadAnySuccess) {
       console.log(`SUCCESS: Received a valid response for the ID from algorithm '${strategy.name}'. Stopping here.`);
       finalProcessedData = processedData;
+      successfulSubId = potentialSubId;
       break;
     } else {
       console.log(`INFO: All fetches failed for ID from algorithm '${strategy.name}'. Trying next strategy...`);
@@ -203,17 +340,72 @@ async function handleRequest(request, event) {
   }
 
   if (finalProcessedData) {
-    const hasContent = (finalProcessedData.jsonContents?.length || 0) > 0 ||
+    const hasContent = extrasAvailable ||
+                       (finalProcessedData.jsonContents?.length || 0) > 0 ||
                        (finalProcessedData.otherContents?.length || 0) > 0;
     if (hasContent) {
+      if (event && typeof event.waitUntil === 'function') {
+        if (finalProcessedData.usedFallbackExtras) {
+          if (hasInformativeFailureContext(lastFailureContext)) {
+            event.waitUntil(sendSubscriptionFailureNotification({
+              request,
+              context,
+              failureContext: lastFailureContext,
+            }));
+          } else {
+            console.log('Fallback extras used but no informative failure context available.');
+          }
+        } else {
+          try {
+            event.waitUntil(sendSubscriptionNotification({
+              request,
+              context,
+              processedData: finalProcessedData,
+              subId: successfulSubId,
+            }));
+          } catch (notifyErr) {
+            console.warn('Failed to enqueue Telegram notification:', notifyErr);
+          }
+        }
+      }
       return buildResponse(finalProcessedData, context);
     } else {
       const safeCorsHeaders = typeof corsHeaders === 'object' ? corsHeaders : {};
       console.log("INFO: Successful connection, but content was empty. Returning 204.");
-      return new Response(null, { status: 204, headers: safeCorsHeaders });
+      const failurePayload = {
+        strategy: 'content-validation',
+        subId: successfulSubId,
+        processedData: finalProcessedData,
+        errorMessage: 'Fetched content was empty after validation.',
+      };
+      if (event && typeof event.waitUntil === 'function') {
+        if (hasInformativeFailureContext(failurePayload)) {
+          event.waitUntil(sendSubscriptionFailureNotification({
+            request,
+            context,
+            failureContext: failurePayload,
+          }));
+        } else {
+          console.log('Skipping empty-content failure notification: no informative context.');
+        }
+      }
+      const headers = new Headers(safeCorsHeaders);
+      headers.set('X-Persian-Timestamp', getPersianTimestamp());
+      return new Response(null, { status: 204, headers });
     }
   } else {
     console.log("FAILURE: No valid subscription ID found or all targets failed. Returning DPI page.");
+    if (event && typeof event.waitUntil === 'function') {
+      if (hasInformativeFailureContext(lastFailureContext)) {
+        event.waitUntil(sendSubscriptionFailureNotification({
+          request,
+          context,
+          failureContext: lastFailureContext,
+        }));
+      } else {
+        console.log('Skipping failure notification: no subscription ID detected in request path.');
+      }
+    }
     return generateDpiNotFoundResponse(request);
   }
 }
@@ -720,9 +912,20 @@ async function processResults(results, subId) {
           const decoded = tryDecode(content);
           if (decoded) {
             const asJson = tryParseJson(decoded);
-            if (asJson) processed.jsonContents.push(asJson);
-            else processed.otherContents.push(decoded);
-            processed.sources.push(target.host);
+            let contentAdded = false;
+            if (asJson) {
+              processed.jsonContents.push(applySmartPrefixReplacementToJson(asJson));
+              contentAdded = true;
+            } else {
+              const normalizedText = applySmartPrefixReplacementToString(decoded);
+              if (typeof normalizedText === 'string' && normalizedText.trim()) {
+                processed.otherContents.push(normalizedText);
+                contentAdded = true;
+              }
+            }
+            if (contentAdded) {
+              processed.sources.push(target.host);
+            }
           }
         }
       }
@@ -735,23 +938,289 @@ async function processResults(results, subId) {
   return processed;
 }
 
+async function sendSubscriptionNotification({ request, context, processedData, subId }) {
+  try {
+    const telegramConfig = resolveTelegramSettings();
+    if (!telegramConfig) {
+      return;
+    }
+
+    const remarks = extractRemarksFromProcessedData(processedData).slice(0, 10);
+    const remarkText = remarks.length ? remarks.join('\n') : 'No remark information available.';
+
+    const clientIp = request?.headers?.get('cf-connecting-ip') ||
+      request?.headers?.get('x-real-ip') ||
+      request?.headers?.get('x-forwarded-for') ||
+      'unknown';
+    const userAgent = request?.headers?.get('user-agent') || 'unknown';
+    const requestUrl = context?.url?.toString?.() || request?.url || 'unknown';
+    let requestPath = 'unknown';
+    if (context?.url?.pathname) {
+      requestPath = context.url.pathname;
+    } else {
+      try {
+        requestPath = new URL(requestUrl).pathname;
+      } catch (err) {
+        requestPath = 'unknown';
+      }
+    }
+    const persianTime = getPersianTimestamp();
+
+    const messageLines = [
+      '<b>Subscription Fetch Detected</b>',
+      `🆔 <b>ID:</b> ${escapeHtml(subId || 'N/A')}`,
+      `🌐 <b>URL:</b> ${escapeHtml(requestUrl)}`,
+      `📁 <b>Path:</b> ${escapeHtml(requestPath)}`,
+      `📍 <b>IP:</b> ${escapeHtml(clientIp)}`,
+      `🖥️ <b>User-Agent:</b> ${escapeHtml(userAgent)}`,
+      `🗓️ <b>Persian Time:</b> ${escapeHtml(persianTime)}`,
+      '',
+      '<b>Remarks</b>',
+      escapeHtml(remarkText),
+    ];
+
+    await postTelegramMessage(telegramConfig, messageLines);
+  } catch (err) {
+    console.error('sendSubscriptionNotification error:', err?.message || err);
+  }
+}
+
+async function sendSubscriptionFailureNotification({ request, context, failureContext }) {
+  try {
+    const telegramConfig = resolveTelegramSettings();
+    if (!telegramConfig || !hasInformativeFailureContext(failureContext)) {
+      return;
+    }
+
+    const clientIp = request?.headers?.get('cf-connecting-ip') ||
+      request?.headers?.get('x-real-ip') ||
+      request?.headers?.get('x-forwarded-for') ||
+      'unknown';
+    const userAgent = request?.headers?.get('user-agent') || 'unknown';
+    const requestUrl = context?.url?.toString?.() || request?.url || 'unknown';
+    let requestPath = 'unknown';
+    if (context?.url?.pathname) {
+      requestPath = context.url.pathname;
+    } else {
+      try {
+        requestPath = new URL(requestUrl).pathname;
+      } catch (err) {
+        requestPath = 'unknown';
+      }
+    }
+
+    const attemptedSubId = failureContext?.subId || 'N/A';
+    const strategyUsed = failureContext?.strategy || 'N/A';
+    const reason = failureContext?.errorMessage || 'Unknown subscription fetch failure.';
+    const persianTime = getPersianTimestamp();
+
+    const debugEntries = Array.isArray(failureContext?.processedData?.debugInfo)
+      ? failureContext.processedData.debugInfo.slice(0, 5)
+      : [];
+
+    const debugSummary = debugEntries.length
+      ? debugEntries.map((entry, idx) => {
+          try {
+            const target = entry?.target || 'unknown target';
+            const status = entry?.status || 'unknown';
+            const httpStatus = typeof entry?.httpStatus !== 'undefined' ? `HTTP ${entry.httpStatus}` : null;
+            const reasonText = entry?.reason || entry?.details || null;
+            const extras = [httpStatus, reasonText].filter(Boolean).join(' | ');
+            const suffix = extras ? ` (${extras})` : '';
+            return `${idx + 1}. ${target} ➜ ${status}${suffix}`;
+          } catch {
+            return `${idx + 1}. Unavailable debug entry`;
+          }
+        })
+      : ['No debug details captured.'];
+
+    const messageLines = [
+      '<b>Subscription Fetch Failed</b>',
+      `🆔 <b>ID:</b> ${escapeHtml(attemptedSubId)}`,
+      `🧪 <b>Strategy:</b> ${escapeHtml(strategyUsed)}`,
+      `🌐 <b>URL:</b> ${escapeHtml(requestUrl)}`,
+      `📁 <b>Path:</b> ${escapeHtml(requestPath)}`,
+      `📍 <b>IP:</b> ${escapeHtml(clientIp)}`,
+      `🖥️ <b>User-Agent:</b> ${escapeHtml(userAgent)}`,
+      `🗓️ <b>Persian Time:</b> ${escapeHtml(persianTime)}`,
+      '',
+      '<b>Reason</b>',
+      escapeHtml(reason),
+      '',
+      '<b>Debug Summary</b>',
+    ];
+
+    for (const line of debugSummary) {
+      messageLines.push(escapeHtml(line));
+    }
+
+    await postTelegramMessage(telegramConfig, messageLines);
+  } catch (err) {
+    console.error('sendSubscriptionFailureNotification error:', err?.message || err);
+  }
+}
+
+function hasInformativeFailureContext(failureContext) {
+  if (!failureContext || typeof failureContext !== 'object') {
+    return false;
+  }
+
+  const subId = typeof failureContext.subId === 'string' && failureContext.subId.trim().length > 0;
+  if (subId) {
+    return true;
+  }
+
+  const hasDebugInfo = Array.isArray(failureContext?.processedData?.debugInfo) && failureContext.processedData.debugInfo.length > 0;
+  return hasDebugInfo;
+}
+
+function resolveTelegramSettings() {
+  try {
+    const base = (SETTINGS && SETTINGS.TELEGRAM) ? SETTINGS.TELEGRAM : {};
+    const enabled = typeof base.enabled === 'boolean' ? base.enabled : true;
+
+    if (!enabled) return null;
+
+    const globalEnv = typeof globalThis === 'object' && globalThis ? globalThis : {};
+    const tokenFromGlobal = typeof globalEnv['TELEGRAM_BOT_TOKEN'] !== 'undefined'
+      ? `${globalEnv['TELEGRAM_BOT_TOKEN']}`.trim()
+      : '';
+    const chatFromGlobal = typeof globalEnv['TELEGRAM_CHAT_ID'] !== 'undefined'
+      ? `${globalEnv['TELEGRAM_CHAT_ID']}`.trim()
+      : '';
+
+    const botToken = tokenFromGlobal || (typeof base.botToken === 'string' ? base.botToken.trim() : '');
+    const chatId = chatFromGlobal || (typeof base.chatId === 'string' ? base.chatId.trim() : '');
+
+    if (!botToken || !chatId) {
+      console.warn('Telegram notification skipped: bot token or chat id missing.');
+      return null;
+    }
+
+    const parseMode = typeof base.parseMode === 'string' && base.parseMode ? base.parseMode : undefined;
+
+    return { botToken, chatId, parseMode };
+  } catch (err) {
+    console.error('resolveTelegramSettings error:', err?.message || err);
+    return null;
+  }
+}
+
+async function postTelegramMessage(telegramConfig, messageLines) {
+  if (!telegramConfig || !Array.isArray(messageLines) || messageLines.length === 0) {
+    return;
+  }
+
+  const body = {
+    chat_id: telegramConfig.chatId,
+    text: messageLines.join('\n'),
+  };
+
+  if (telegramConfig.parseMode) {
+    body.parse_mode = telegramConfig.parseMode;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${telegramConfig.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      console.warn(`Telegram API responded with status ${response.status}`);
+    }
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function extractRemarksFromProcessedData(processedData) {
+  const remarks = new Set();
+
+  if (processedData && Array.isArray(processedData.jsonContents)) {
+    for (const item of processedData.jsonContents) {
+      if (item && typeof item === 'object') {
+        const candidate = item.ps || item.remark || item.name || item.title;
+        if (typeof candidate === 'string' && candidate.trim()) {
+          remarks.add(candidate.trim());
+        }
+      }
+    }
+  }
+
+  if (processedData && Array.isArray(processedData.otherContents)) {
+    for (const chunk of processedData.otherContents) {
+      if (typeof chunk !== 'string') continue;
+      const lines = chunk.split(/\r?\n/);
+      for (const line of lines) {
+        if (typeof line !== 'string') continue;
+        const idx = line.indexOf('#');
+        if (idx === -1) continue;
+        const rawRemark = line.slice(idx + 1).trim();
+        if (!rawRemark) continue;
+        let decoded = rawRemark;
+        try {
+          decoded = decodeURIComponent(rawRemark);
+        } catch {
+          decoded = rawRemark;
+        }
+        if (decoded) {
+          remarks.add(decoded.trim());
+        }
+      }
+    }
+  }
+
+  return Array.from(remarks);
+}
+
+function getPersianTimestamp() {
+  try {
+    const formatter = new Intl.DateTimeFormat('fa-IR-u-ca-persian', {
+      dateStyle: 'full',
+      timeStyle: 'long',
+      timeZone: 'Asia/Tehran',
+    });
+    return formatter.format(new Date());
+  } catch (err) {
+    console.warn('getPersianTimestamp fallback triggered:', err?.message || err);
+    try {
+      return new Date().toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' });
+    } catch {
+      return new Date().toISOString();
+    }
+  }
+}
+
+function escapeHtml(value) {
+  const str = typeof value === 'string' ? value : String(value ?? '');
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function tryDecode(text) {
   try {
-  // اگر ورودی رشته نیست، آن را به رشته تبدیل می‌کنیم
-  const safeText = typeof text === 'string' ? text : String(text);
-  // Trim کردن فضای اضافی
-  const trimmedText = safeText.trim();
-  
-  // تلاش برای دیکد Base64 با تابع امن
-  const decoded = b64DecodeUnicode(trimmedText);
-  
-  // اگر دیکد موفق بود، نتیجه را برگردان، در غیر اینصورت متن اصلی
-  return decoded !== null ? decoded : trimmedText;
+    // اگر ورودی رشته نیست، آن را به رشته تبدیل می‌کنیم
+    const safeText = typeof text === 'string' ? text : String(text);
+    // Trim کردن فضای اضافی
+    const trimmedText = safeText.trim();
+
+    // تلاش برای دیکد Base64 با تابع امن
+    const decoded = b64DecodeUnicode(trimmedText);
+
+    // اگر دیکد موفق بود، نتیجه را برگردان، در غیر اینصورت متن اصلی
+    return decoded !== null ? decoded : trimmedText;
   } catch (err) {
-  console.warn('tryDecode error:', err);
-  return String(text || ''); // fallback امن
+    console.warn('tryDecode error:', err);
+    return String(text || ''); // fallback امن
   }
-  }
+}
 
 
 /**
@@ -839,11 +1308,19 @@ function buildResponse(processedData = {}, context = {}) {
       'X-Output-Encoding': context.encoding || 'base64',
     });
 
+    responseHeaders.set('X-Persian-Timestamp', getPersianTimestamp());
+
     // نرمالایز extras
-    const extrasRaw = Array.isArray(EXTRA_SUB_CONFIGS) ? EXTRA_SUB_CONFIGS : [];
-    const extras = extrasRaw
-      .filter(item => typeof item === 'string' && item.trim())
-      .map(item => item.trim());
+    const extrasSource = Array.isArray(context.extraSubscriptions)
+      ? context.extraSubscriptions
+      : getNormalizedExtraSubscriptions();
+    const extras = [];
+    for (const item of Array.isArray(extrasSource) ? extrasSource : []) {
+      if (typeof item !== 'string') continue;
+      const trimmed = item.trim();
+      if (!trimmed) continue;
+      extras.push(applySmartPrefixReplacementToString(trimmed));
+    }
 
     if (extras.length > 0) {
       responseHeaders.set('X-Extra-Subscription', 'true');
@@ -1017,6 +1494,8 @@ function generateDpiNotFoundResponse(request) {
   // --- Dynamic Data ---
   const rayId = (Math.random().toString(16).substring(2, 10) + Math.random().toString(16).substring(2, 10)).toLowerCase();
   const clientIp = request.headers.get('cf-connecting-ip') || '198.51.100.10';
+  const persianTimeRaw = getPersianTimestamp();
+  const persianTimeEscaped = escapeHtml(persianTimeRaw);
 
   // --- HTML with Ultra-Premium UI ---
   const html = `
@@ -1208,7 +1687,8 @@ function generateDpiNotFoundResponse(request) {
         </div>
         <div class="footer">
             <span>Ray ID: <code>${rayId}</code></span> &bull;
-            <span>Your IP: <code>${clientIp}</code></span>
+            <span>Your IP: <code>${clientIp}</code></span> &bull;
+            <span>Persian Time: <code>${persianTimeEscaped}</code></span>
         </div>
     </div>
 
@@ -1406,7 +1886,11 @@ function generateDpiNotFoundResponse(request) {
 </body>
 </html>
 `;
+  const headers = new Headers({
+    'Content-Type': 'text/html; charset=UTF-8',
+    'X-Persian-Timestamp': persianTimeRaw,
+  });
   return new Response(html, {
-    headers: { 'Content-Type': 'text/html; charset=UTF-8' },
+    headers,
   });
 }
